@@ -1,112 +1,164 @@
 import os
+import csv
 from dotenv import load_dotenv
+
 from azure.identity import DefaultAzureCredential
-from azure.mgmt.costmanagement import CostManagementClient
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.storage import StorageManagementClient
 from azure.storage.blob import BlobServiceClient
-
-try:
-  # Load Credentials 
-  load_dotenv(dotenv_path="cred.env")
-  subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
-  credential = DefaultAzureCredential()
+from azure.mgmt.costmanagement import CostManagementClient
+from settings import AUTO_DELETE , PROTECTED_TAG , REPORT_FILE
 
 
-  # create clients
-  compute_client = ComputeManagementClient(credential,subscription_id)
-  cost_client = CostManagementClient(credential)
-  storage_client = StorageManagementClient(credential, subscription_id)
+print("\n===== Azure Cost Optimization Tool =====\n")
+
+# LOAD AZZURE CRENDENTIALS
+
+load_dotenv("cred.env")
+subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
+
+if not subscription_id:
+    raise ValueError(" Subscription ID missing in cred.env")
+
+credential = DefaultAzureCredential()
+
+# CREATE AZURE CLIENTS
+
+compute_client = ComputeManagementClient(credential, subscription_id)
+storage_client = StorageManagementClient(credential, subscription_id)
+cost_client = CostManagementClient(credential)
+
+results = []
 
 
-  #open report file
-  with open ("cost_report.txt", "w") as report:
-    report.write("==== Cost Optimization Report ====\n")
+# HELP FUNCTIONS
+
+def is_protected(tags: dict) -> bool:
+    """Skip deletion if resource is tagged safe=yes."""
+    return tags and tags.get(PROTECTED_TAG, "").lower() == "yes"
 
 
-    # Check for stopped or idle Vms
-    report.write("\n Idle or Stopped Vms: \n")
+def log(rg, name, rtype, status):
+    results.append([rg, name, rtype, status])
+
+
+# SCANNERS 
+
+def check_vms():
+    print(" Checking VM Power States...")
+
     for vm in compute_client.virtual_machines.list_all():
-       rg_name = vm.id.split("/")[4]
-       instance_view = compute_client.virtual_machines.instance_view(rg_name,vm.name)
-       statuses = [s.code for s in instance_view.statuses]
-       if any ("PowerState/stopped" in s for s in statuses):
-         report.write(f"{vm.name} in {rg_name} is stopped - may still cost money. \n")
-       elif any ("PowerState/deallocated" in s for s in statuses):
-         report.write(f"{vm.name} in {rg_name} is deallocated - not charged. \n")
-       else: 
-         report.write(f"{vm.name} in {rg_name} is running. \n")
+        rg = vm.id.split("/")[4]
+        instance = compute_client.virtual_machines.instance_view(rg, vm.name)
+        states = [s.code for s in instance.statuses]
+
+        if "PowerState/stopped" in str(states):
+            log(rg, vm.name, "VM", "Stopped — billing may apply")
+        elif "PowerState/deallocated" in str(states):
+            log(rg, vm.name, "VM", "Deallocated — No cost")
+        else:
+            log(rg, vm.name, "VM", "Running")
 
 
+def check_disks():
+    print(" Finding unused disks...")
 
-    # check for unattached disks
-
-    report.write("\n Unattached Disks: \n")
     for disk in compute_client.disks.list():
-      if disk.managed_by is None:
-        report.write(f"{disk.name} ({disk.disk_size_gb} GB) - disk is Unattached consider deleting. \n")
-      else:
-        report.write(f"{disk.name} ({disk.disk_size_gb} GB) - disk is attached. \n")
-    
+        rg = disk.id.split("/")[4]
+
+        if disk.managed_by is None:
+            status = "Unattached — recommended for cleanup"
+
+            if is_protected(disk.tags):
+                status = "⚠ Protected (safe=yes) — skipped"
+
+            log(rg, disk.name, "Disk", status)
+
+            if AUTO_DELETE and not is_protected(disk.tags):
+                print(f"🗑 Removing disk: {disk.name}")
+                compute_client.disks.begin_delete(rg, disk.name)
 
 
-    #cost summary --> payAsYouGo subscription support Cost Management API
+def check_storage():
+    print(" Checking blob storage for empty containers...")
 
-    report.write("\n Monthly Cost by Resource Group: \n")
-    result = cost_client.query.usage(
-      scope=f"/subscriptions/{subscription_id}",
-      parameters = { 
+    for account in storage_client.storage_accounts.list():
+        rg = account.id.split("/")[4]
+        blob_client = BlobServiceClient(
+            f"https://{account.name}.blob.core.windows.net/",
+            credential
+        )
+
+        for container in blob_client.list_containers():
+            items = list(blob_client.get_container_client(container.name).list_blobs(limit=1))
+            if not items:
+                log(rg, container.name, "Blob Container", "Empty — cleanup recommended")
+
+
+# COST ANALYSIS 
+def cost_analysis():
+    print(" Analyzing monthly cost by resource group...")
+
+    scope = f"/subscriptions/{subscription_id}"
+
+    params = {
         "type": "Usage",
         "timeframe": "MonthToDate",
         "dataset": {
-          "granularity": "Daily",
-          "aggregation": {"totalCost": {"name": "PreTaxCost", "function": "Sum"}},
-          "grouping": [{"type": "Dimension", "name": "ResourceGroupName"}],
+            "granularity": "None",
+            "aggregation": {
+                "totalCost": {"name": "PreTaxCost", "function": "Sum"}
+            },
+            "grouping": [{"type": "Dimension", "name": "ResourceGroupName"}],
         },
-      },
-    )
-    for row in result.rows:
-        group_name, cost = row[0], row[1]
-        report.write(f"{group_name:20} : ₹{cost:.2f}\n")
+    }
+
+    try:
+        result = cost_client.query.usage(scope, params)
+
+        cost_rows = []
+        for row in result.rows:
+            rg, cost = row[0], row[1]
+            cost_rows.append([rg, f"rs:{cost:.2f}"])
+
+        return cost_rows
+
+    except Exception as e:
+        print(" Cost API unavailable for this subscription type.")
+        print("   Skipping cost breakdown.\n")
+        return [["Not Supported", "N/A"]]
+
+
+# REPORTING
+
+def write_report(cost_table):
+    print("\n Writing CSV Report...")
+
+    with open(REPORT_FILE, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Resource Group", "Name", "Type", "Status"])
+        writer.writerows(results)
+
+        writer.writerow([])
+        writer.writerow(["====== Monthly Cost Summary ======"])
+        writer.writerow(["Resource Group", "Estimated Cost"])
+        writer.writerows(cost_table)
+
+    print(f" Report saved as: {REPORT_FILE}")
 
 
 
-    # Right size suggestions
+def main():
+    check_vms()
+    check_disks()
+    check_storage()
 
-    report.write("\n Right Size Recommendation: \n")
-    for vm in compute_client.virtual_machines.list_all():
-      size = vm.hardware_profile.vm_size
-      if "Standard_D" in size:
-          report.write(f"{vm.name}: Consider resizing from {size} --> Standard_B2s. \n")
-      elif "Standard_E" in size:
-          report.write(f"{vm.name}: Could switch from {size} --> Standard_D2s_v3. \n")
-      else:
-         report.write(f"{vm.name}: Size {size} is Reasonable. \n")
+    cost_data = cost_analysis()
+    write_report(cost_data)
+
+    print("\n Mode:", "AUTO DELETE ENABLED" if AUTO_DELETE else "READ-ONLY")
+    print(" Completed.\n")
 
 
-    # --- Blob Storage Analysis ---
-    report.write("\nUnused or Empty Blob Containers:\n")
-    for account in storage_client.storage_accounts.list():
-      rg_name = account.id.split("/")[4]
-      account_name = account.name
-      try:
-       # Connect to the blob service
-  
-          blob_service_client = BlobServiceClient(f"https://{account_name}.blob.core.windows.net/",credential=credential)
-          containers = blob_service_client.list_containers()
-          empty_found = False
-          for container in containers:
-            container_client = blob_service_client.get_container_client(container.name)
-            blobs = container_client.list_blobs(limit=1)  # check if container has at least one blob
-            if not any(blobs):
-              report.write(f"Empty container: {container.name} in account {account_name} ({rg_name})\n")
-              empty_found = True
-          if not empty_found:
-            report.write(f"Storage account {account_name} ({rg_name}) has no empty containers.\n")
-      except Exception as e:
-        report.write(f"Could not access storage account {account_name}: {e}\n")
-
-    print("All results saved in cost_report.txt")
-
-except ValueError:
-  print("Subscription ID not found !")
+if __name__ == "__main__":
+    main()
